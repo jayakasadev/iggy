@@ -334,6 +334,531 @@ impl IggyErrorContext for IggyError {
 }
 
 // =====================================================================
+// BufferedMultipartWriter — coalesces small flushes to S3 part minimums
+// =====================================================================
+
+use std::rc::Rc;
+
+/// Buffers writes until they reach `part_size`, then uploads each chunk as
+/// one part of an in-progress multipart write.
+///
+/// This adapter is what makes iggy's typical sub-MiB flush sizes compatible
+/// with AWS S3's hard 5 MiB minimum part size (except the final part).
+/// `seal()` flushes any residual buffer as the last part. As a small-segment
+/// optimization, if no parts have been uploaded yet AND the residual buffer
+/// is below the 5 MiB part minimum, the multipart is aborted and the buffer
+/// is written via a single `put` instead — avoiding a CompleteMultipartUpload
+/// that would otherwise fail with `EntityTooSmall`.
+pub struct BufferedMultipartWriter {
+    storage: Rc<dyn ObjectStorage>,
+    key: String,
+    handle: Option<Box<dyn MultipartHandle>>,
+    buffer: bytes::BytesMut,
+    part_size: usize,
+    parts_uploaded: u32,
+}
+
+/// AWS S3 minimum size for any non-final multipart part.
+pub const S3_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
+impl BufferedMultipartWriter {
+    /// Open a buffered multipart write at `key`. `part_size` must be at
+    /// least [`S3_MIN_PART_SIZE`] (5 MiB) — this is enforced at config-load
+    /// time but re-asserted here for direct callers.
+    pub async fn open(
+        storage: Rc<dyn ObjectStorage>,
+        key: &str,
+        part_size: usize,
+    ) -> Result<Self, IggyError> {
+        debug_assert!(
+            part_size >= S3_MIN_PART_SIZE,
+            "BufferedMultipartWriter::open: part_size {} below S3 5 MiB minimum",
+            part_size,
+        );
+        let handle = storage.put_multipart(key).await?;
+        Ok(Self {
+            storage,
+            key: key.to_owned(),
+            handle: Some(handle),
+            buffer: bytes::BytesMut::with_capacity(part_size),
+            part_size,
+            parts_uploaded: 0,
+        })
+    }
+
+    /// Append bytes to the in-progress upload, flushing whole parts to the
+    /// backend as the buffer crosses `part_size`.
+    pub async fn append(&mut self, bytes: &[u8]) -> Result<(), IggyError> {
+        self.buffer.extend_from_slice(bytes);
+        while self.buffer.len() >= self.part_size {
+            let chunk = self.buffer.split_to(self.part_size).freeze();
+            let handle = self.handle.as_mut().ok_or(IggyError::CannotAppendToFile)?;
+            handle.upload_part(chunk).await?;
+            self.parts_uploaded += 1;
+        }
+        Ok(())
+    }
+
+    /// Total bytes appended so far (across uploaded parts and the buffer).
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Number of complete parts uploaded so far.
+    pub fn parts_uploaded(&self) -> u32 {
+        self.parts_uploaded
+    }
+
+    /// Seal the upload. Returns the backend etag, or empty string if the
+    /// small-segment fallback path was taken.
+    pub async fn seal(mut self) -> Result<String, IggyError> {
+        // Small-segment optimization: nothing has been parted out yet AND the
+        // residual is below S3's minimum — abort multipart, single PUT.
+        if self.parts_uploaded == 0 && self.buffer.len() < S3_MIN_PART_SIZE {
+            if let Some(handle) = self.handle.take() {
+                handle.abort().await?;
+            }
+            let bytes = self.buffer.freeze();
+            self.storage.put(&self.key, bytes).await?;
+            return Ok(String::new());
+        }
+
+        // Normal path: flush residual as the final part, then complete.
+        let mut handle = self.handle.take().ok_or(IggyError::CannotAppendToFile)?;
+        if !self.buffer.is_empty() {
+            let final_part = std::mem::take(&mut self.buffer).freeze();
+            handle.upload_part(final_part).await?;
+        }
+        handle.complete().await
+    }
+
+    /// Discard the upload and any backend state.
+    pub async fn abort(mut self) -> Result<(), IggyError> {
+        if let Some(handle) = self.handle.take() {
+            handle.abort().await?;
+        }
+        Ok(())
+    }
+}
+
+// =====================================================================
+// S3Storage — rusty-s3 + cyper, behind cargo features = ["object-storage"]
+// =====================================================================
+
+#[cfg(feature = "object-storage")]
+mod s3 {
+    use super::*;
+    use crate::configs::system::ObjectStorageConfig;
+    use rusty_s3::actions::S3Action;
+    use rusty_s3::{Bucket, Credentials, UrlStyle};
+    use std::time::Duration;
+
+    /// Time-to-live for presigned URLs. Each S3 call signs a short-lived
+    /// URL and dispatches it via cyper. A few minutes is plenty for the
+    /// per-call latency we observe in practice.
+    const PRESIGN: Duration = Duration::from_secs(300);
+
+    /// AWS S3 client built on rusty-s3 (sans-IO SigV4 + request building)
+    /// and cyper (compio HTTP client, rustls TLS). Phase 0 spike validated
+    /// this combination against AWS S3 in account 208116833703 / us-east-1.
+    pub struct S3Storage {
+        bucket: Bucket,
+        creds: Credentials,
+        http: cyper::Client,
+        prefix: String,
+    }
+
+    impl std::fmt::Debug for S3Storage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("S3Storage")
+                .field("bucket", &self.bucket.name())
+                .field("region", &self.bucket.region())
+                .field("prefix", &self.prefix)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl S3Storage {
+        /// Build from `[system.storage.object]` config. Credentials are read
+        /// from config first; callers wanting env-var or profile resolution
+        /// should populate the config struct upstream of this constructor
+        /// (see `crate::bootstrap::resolve_object_storage`).
+        pub fn from_config(config: &ObjectStorageConfig) -> Result<Self, IggyError> {
+            if !config.service.eq_ignore_ascii_case("s3") {
+                tracing::warn!(
+                    "system.storage.object.service = {:?}; only \"s3\" is recognized",
+                    config.service,
+                );
+            }
+            if config.bucket.is_empty() {
+                return Err(IggyError::CannotOverwriteFile);
+            }
+            let endpoint = endpoint_url(config)?;
+            let url_style = if config.endpoint.is_empty() {
+                UrlStyle::VirtualHost
+            } else {
+                UrlStyle::Path
+            };
+            let bucket = Bucket::new(
+                endpoint,
+                url_style,
+                config.bucket.clone(),
+                config.region.clone(),
+            )
+            .error(|e: &rusty_s3::BucketError| {
+                format!("{COMPONENT} (error: {e}) - construct rusty-s3 Bucket")
+            })
+            .map_err(|_| IggyError::CannotOverwriteFile)?;
+            let creds = if config.access_key_id.is_empty() && config.secret_access_key.is_empty() {
+                return Err(IggyError::CannotOverwriteFile);
+            } else {
+                Credentials::new(
+                    config.access_key_id.clone(),
+                    config.secret_access_key.clone(),
+                )
+            };
+            Ok(Self {
+                bucket,
+                creds,
+                http: cyper::Client::new(),
+                prefix: config.prefix.trim_end_matches('/').to_owned(),
+            })
+        }
+
+        fn full_key(&self, key: &str) -> String {
+            if self.prefix.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{}/{}", self.prefix, key.trim_start_matches('/'))
+            }
+        }
+
+        async fn execute(
+            &self,
+            req: cyper::Request,
+            op: &str,
+        ) -> Result<cyper::Response, IggyError> {
+            self.http
+                .execute(req)
+                .await
+                .error(|e: &cyper::Error| format!("{COMPONENT} (error: {e}) - {op}"))
+                .map_err(|_| IggyError::CannotWriteToFile)
+        }
+    }
+
+    fn endpoint_url(config: &ObjectStorageConfig) -> Result<url::Url, IggyError> {
+        let raw = if config.endpoint.is_empty() {
+            // AWS default. us-east-1 has a region-less endpoint historically,
+            // but the regional form works everywhere.
+            format!("https://s3.{}.amazonaws.com", config.region)
+        } else {
+            config.endpoint.clone()
+        };
+        raw.parse::<url::Url>()
+            .error(|e: &url::ParseError| {
+                format!("{COMPONENT} (error: {e}) - parse endpoint: {raw}")
+            })
+            .map_err(|_| IggyError::CannotOverwriteFile)
+    }
+
+    fn require_2xx(resp: &cyper::Response, op: &str) -> Result<(), IggyError> {
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        tracing::warn!(
+            target: "object_store",
+            "{COMPONENT} - {op}: HTTP {}",
+            resp.status().as_u16(),
+        );
+        // Caller picks the best IggyError variant; this is just the gate.
+        Err(IggyError::CannotWriteToFile)
+    }
+
+    fn strip_etag(value: &str) -> String {
+        value.trim_matches('"').to_owned()
+    }
+
+    #[async_trait(?Send)]
+    impl ObjectStorage for S3Storage {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<(), IggyError> {
+            let key = self.full_key(key);
+            let action = self.bucket.put_object(Some(&self.creds), &key);
+            let url = action.sign(PRESIGN);
+            let req = self
+                .http
+                .put(url.as_str())
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .body(bytes.to_vec())
+                .build();
+            let resp = self.execute(req, "PUT").await?;
+            require_2xx(&resp, "PUT")
+        }
+
+        async fn put_if_absent(&self, key: &str, bytes: Bytes) -> Result<(), IggyError> {
+            let key = self.full_key(key);
+            let action = self.bucket.put_object(Some(&self.creds), &key);
+            let url = action.sign(PRESIGN);
+            let req = self
+                .http
+                .put(url.as_str())
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .header("If-None-Match", "*")
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .body(bytes.to_vec())
+                .build();
+            let resp = self.execute(req, "PUT-if-none-match").await?;
+            if resp.status().as_u16() == 412 {
+                return Err(IggyError::CannotOverwriteFile);
+            }
+            require_2xx(&resp, "PUT-if-none-match")
+        }
+
+        async fn put_multipart(&self, key: &str) -> Result<Box<dyn MultipartHandle>, IggyError> {
+            let key = self.full_key(key);
+            let create = self.bucket.create_multipart_upload(Some(&self.creds), &key);
+            let url = create.sign(PRESIGN);
+            let req = self
+                .http
+                .post(url.as_str())
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .build();
+            let resp = self.execute(req, "CreateMultipartUpload").await?;
+            require_2xx(&resp, "CreateMultipartUpload")?;
+            let body = resp
+                .text()
+                .await
+                .map_err(|_| IggyError::CannotWriteToFile)?;
+            let parsed =
+                rusty_s3::actions::CreateMultipartUpload::parse_response(&body).map_err(|e| {
+                    tracing::warn!("{COMPONENT} (error: {e}) - parse CreateMultipartUpload");
+                    IggyError::CannotWriteToFile
+                })?;
+            Ok(Box::new(S3Multipart {
+                bucket: self.bucket.clone(),
+                creds: self.creds.clone(),
+                http: self.http.clone(),
+                key,
+                upload_id: parsed.upload_id().to_owned(),
+                parts: Vec::new(),
+                next_part: 1,
+            }))
+        }
+
+        async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes, IggyError> {
+            let key = self.full_key(key);
+            let action = self.bucket.get_object(Some(&self.creds), &key);
+            let url = action.sign(PRESIGN);
+            // S3 Range header is inclusive on both ends.
+            let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1),);
+            let req = self
+                .http
+                .get(url.as_str())
+                .map_err(|_| IggyError::CannotReadFile)?
+                .header("Range", range_header)
+                .map_err(|_| IggyError::CannotReadFile)?
+                .build();
+            let resp = self.execute(req, "GET-range").await?;
+            if !resp.status().is_success() {
+                return Err(IggyError::CannotReadFile);
+            }
+            resp.bytes().await.map_err(|_| IggyError::CannotReadFile)
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, IggyError> {
+            let full = self.full_key(key);
+            let action = self.bucket.head_object(Some(&self.creds), &full);
+            let url = action.sign(PRESIGN);
+            let req = self
+                .http
+                .head(url.as_str())
+                .map_err(|_| IggyError::CannotReadFileMetadata)?
+                .build();
+            let resp = self.execute(req, "HEAD").await?;
+            if !resp.status().is_success() {
+                return Err(IggyError::CannotReadFileMetadata);
+            }
+            let size = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or(IggyError::CannotReadFileMetadata)?;
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(strip_etag);
+            Ok(ObjectMeta {
+                key: full,
+                size,
+                etag,
+            })
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectMeta>, IggyError> {
+            let full_prefix = self.full_key(prefix);
+            let mut out = Vec::new();
+            let mut continuation: Option<String> = None;
+            loop {
+                let mut action = self.bucket.list_objects_v2(Some(&self.creds));
+                action.with_prefix(&full_prefix);
+                if let Some(token) = &continuation {
+                    action.with_continuation_token(token);
+                }
+                let url = action.sign(PRESIGN);
+                let req = self
+                    .http
+                    .get(url.as_str())
+                    .map_err(|_| IggyError::CannotReadFile)?
+                    .build();
+                let resp = self.execute(req, "ListObjectsV2").await?;
+                require_2xx(&resp, "ListObjectsV2")?;
+                let body = resp.text().await.map_err(|_| IggyError::CannotReadFile)?;
+                let parsed =
+                    rusty_s3::actions::ListObjectsV2::parse_response(&body).map_err(|e| {
+                        tracing::warn!("{COMPONENT} (error: {e}) - parse ListObjectsV2");
+                        IggyError::CannotReadFile
+                    })?;
+                for content in parsed.contents {
+                    out.push(ObjectMeta {
+                        key: content.key,
+                        size: content.size,
+                        etag: Some(strip_etag(&content.etag)),
+                    });
+                }
+                continuation = parsed.next_continuation_token;
+                if continuation.is_none() {
+                    break;
+                }
+            }
+            Ok(out)
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), IggyError> {
+            let key = self.full_key(key);
+            let action = self.bucket.delete_object(Some(&self.creds), &key);
+            let url = action.sign(PRESIGN);
+            let req = self
+                .http
+                .delete(url.as_str())
+                .map_err(|_| IggyError::CannotDeleteFile)?
+                .build();
+            let resp = self.execute(req, "DELETE").await?;
+            // S3 returns 204 (success) for both existing-and-deleted and missing.
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                Err(IggyError::CannotDeleteFile)
+            }
+        }
+    }
+
+    pub use S3Storage as PubExport;
+
+    struct S3Multipart {
+        bucket: Bucket,
+        creds: Credentials,
+        http: cyper::Client,
+        key: String,
+        upload_id: String,
+        parts: Vec<String>,
+        next_part: u16,
+    }
+
+    #[async_trait(?Send)]
+    impl MultipartHandle for S3Multipart {
+        async fn upload_part(&mut self, bytes: Bytes) -> Result<(), IggyError> {
+            let action = self.bucket.upload_part(
+                Some(&self.creds),
+                &self.key,
+                self.next_part,
+                &self.upload_id,
+            );
+            let url = action.sign(PRESIGN);
+            let req = self
+                .http
+                .put(url.as_str())
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .body(bytes.to_vec())
+                .build();
+            let resp = self
+                .http
+                .execute(req)
+                .await
+                .map_err(|_| IggyError::CannotWriteToFile)?;
+            if !resp.status().is_success() {
+                return Err(IggyError::CannotWriteToFile);
+            }
+            // AWS wraps ETag in quotes; rusty-s3's CompleteMultipartUpload
+            // re-wraps when serializing the XML body, so we strip here.
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(strip_etag)
+                .ok_or(IggyError::CannotWriteToFile)?;
+            self.parts.push(etag);
+            self.next_part = self.next_part.saturating_add(1);
+            Ok(())
+        }
+
+        async fn complete(self: Box<Self>) -> Result<String, IggyError> {
+            let action = self.bucket.complete_multipart_upload(
+                Some(&self.creds),
+                &self.key,
+                &self.upload_id,
+                self.parts.iter().map(|s| s.as_ref()),
+            );
+            let url = action.sign(PRESIGN);
+            let body = action.body();
+            let req = self
+                .http
+                .post(url.as_str())
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .header("Content-Type", "application/xml")
+                .map_err(|_| IggyError::CannotWriteToFile)?
+                .body(body.into_bytes())
+                .build();
+            let resp = self
+                .http
+                .execute(req)
+                .await
+                .map_err(|_| IggyError::CannotWriteToFile)?;
+            if !resp.status().is_success() {
+                return Err(IggyError::CannotWriteToFile);
+            }
+            // S3 sometimes returns 200 with an embedded <Error>; treat that
+            // as a failure too.
+            let body = resp
+                .text()
+                .await
+                .map_err(|_| IggyError::CannotWriteToFile)?;
+            if body.contains("<Error>") {
+                return Err(IggyError::CannotWriteToFile);
+            }
+            Ok(format!("multipart-{}", self.upload_id))
+        }
+
+        async fn abort(self: Box<Self>) -> Result<(), IggyError> {
+            let action =
+                self.bucket
+                    .abort_multipart_upload(Some(&self.creds), &self.key, &self.upload_id);
+            let url = action.sign(PRESIGN);
+            let req = self
+                .http
+                .delete(url.as_str())
+                .map_err(|_| IggyError::CannotDeleteFile)?
+                .build();
+            let _ = self.http.execute(req).await; // best-effort
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "object-storage")]
+pub use s3::PubExport as S3Storage;
+
+// =====================================================================
 // InMemoryStorage — test-only, HashMap-backed
 // =====================================================================
 
@@ -630,5 +1155,121 @@ mod tests {
 
         let got = s.get_range(&key, 0..11).await.unwrap();
         assert_eq!(got.as_ref(), b"part1-part2");
+    }
+
+    // ---- BufferedMultipartWriter ----
+    //
+    // The buffer is what makes typical sub-MiB iggy flushes legal under
+    // S3's 5 MiB-per-part minimum. These tests use InMemoryStorage and
+    // exercise the four states from the Phase 0 spec: below threshold
+    // (no parts), crossing threshold (one part), seal-with-residual
+    // (final part flushed), and small-segment-fallback (multipart aborted,
+    // single PUT).
+
+    fn rc_store() -> Rc<dyn ObjectStorage> {
+        Rc::new(InMemoryStorage::new())
+    }
+
+    #[compio::test]
+    async fn buffered_writer_below_threshold_no_parts() {
+        let s = rc_store();
+        let mut w = BufferedMultipartWriter::open(s.clone(), "k", S3_MIN_PART_SIZE)
+            .await
+            .unwrap();
+        w.append(&[0u8; 1024]).await.unwrap();
+        assert_eq!(w.parts_uploaded(), 0);
+        assert_eq!(w.buffered_bytes(), 1024);
+    }
+
+    #[compio::test]
+    async fn buffered_writer_crossing_threshold_emits_one_part() {
+        let s = rc_store();
+        let mut w = BufferedMultipartWriter::open(s.clone(), "k", S3_MIN_PART_SIZE)
+            .await
+            .unwrap();
+        // 5 MiB exactly → one part flushed, buffer empty.
+        w.append(&vec![0u8; S3_MIN_PART_SIZE]).await.unwrap();
+        assert_eq!(w.parts_uploaded(), 1);
+        assert_eq!(w.buffered_bytes(), 0);
+    }
+
+    #[compio::test]
+    async fn buffered_writer_seal_with_residual_completes() {
+        let s = rc_store();
+        let mut w = BufferedMultipartWriter::open(s.clone(), "k", S3_MIN_PART_SIZE)
+            .await
+            .unwrap();
+        // 5 MiB + 1 KiB residual → 1 part + 1 final small part.
+        w.append(&vec![0u8; S3_MIN_PART_SIZE]).await.unwrap();
+        w.append(&vec![1u8; 1024]).await.unwrap();
+        assert_eq!(w.parts_uploaded(), 1);
+        assert_eq!(w.buffered_bytes(), 1024);
+        let etag = w.seal().await.unwrap();
+        assert!(etag.starts_with("im-etag-"));
+
+        let meta = s.head("k").await.unwrap();
+        assert_eq!(meta.size as usize, S3_MIN_PART_SIZE + 1024);
+    }
+
+    #[compio::test]
+    async fn buffered_writer_small_segment_fallback_does_single_put() {
+        let s = rc_store();
+        let mut w = BufferedMultipartWriter::open(s.clone(), "k", S3_MIN_PART_SIZE)
+            .await
+            .unwrap();
+        // 100 bytes — below S3 minimum, no parts yet → fallback path.
+        w.append(b"hello world").await.unwrap();
+        assert_eq!(w.parts_uploaded(), 0);
+        let etag = w.seal().await.unwrap();
+        // Fallback path returns empty etag (no multipart final etag).
+        assert!(etag.is_empty());
+
+        let got = s.get_range("k", 0..11).await.unwrap();
+        assert_eq!(got.as_ref(), b"hello world");
+    }
+
+    // ---- S3 wire test (gated on IGGY_TEST_MINIO) ----
+    //
+    // Skips by default. With MinIO running on localhost:9000 (or a custom
+    // S3-compatible endpoint), set the env to exercise the real wire code.
+
+    #[cfg(feature = "object-storage")]
+    #[compio::test]
+    async fn s3_minio_round_trip() {
+        if std::env::var("IGGY_TEST_MINIO").is_err() {
+            return;
+        }
+        use crate::configs::system::ObjectStorageConfig;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = ObjectStorageConfig {
+            service: "s3".into(),
+            bucket: std::env::var("IGGY_TEST_MINIO_BUCKET").unwrap_or_else(|_| "iggy-test".into()),
+            region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            endpoint: std::env::var("S3_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:9000".into()),
+            prefix: format!(
+                "test-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros()
+            ),
+            multipart_part_size: iggy_common::IggyByteSize::from(8 * 1024 * 1024_u64),
+            ack_after_upload: true,
+            access_key_id: std::env::var("AWS_ACCESS_KEY_ID")
+                .unwrap_or_else(|_| "minioadmin".into()),
+            secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
+            profile: String::new(),
+        };
+        let s3 = S3Storage::from_config(&config).expect("S3Storage::from_config");
+
+        // PUT + GET round-trip on a small object.
+        s3.put("hello.bin", Bytes::from_static(b"hello"))
+            .await
+            .expect("put");
+        let got = s3.get_range("hello.bin", 0..5).await.expect("get_range");
+        assert_eq!(got.as_ref(), b"hello");
+        s3.delete("hello.bin").await.expect("delete");
     }
 }
