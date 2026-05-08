@@ -93,6 +93,7 @@ rust-embed = { workspace = true, optional = true }
 rusty-s3 = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rusty-s3 = { workspace = true, optional = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
